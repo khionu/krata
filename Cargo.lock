@@ -1472,6 +1472,7 @@ dependencies = [
  "oci-spec",
  "path-absolutize",
  "platform-info",
+ "pty-process",
  "rtnetlink",
  "serde",
  "serde_json",
@@ -2227,6 +2228,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-process"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8749b545e244c90bf74a5767764cc2194f1888bb42f84015486a64c82bea5cc0"
+dependencies = [
+ "libc",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2509,6 +2521,7 @@ checksum = "65e04861e65f21776e67888bfbea442b3642beaa0138fdb1dd7a84a52dffdb89"
 dependencies = [
  "bitflags 2.5.0",
  "errno",
+ "itoa",
  "libc",
  "linux-raw-sys",
  "windows-sys 0.52.0",
