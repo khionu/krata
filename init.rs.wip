@@ -9,17 +9,18 @@ use std::{
   os::unix::fs::{chroot, PermissionsExt},
   path::{Path, PathBuf},
   str::FromStr,
+  sync::Arc,
+  time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use log::{trace, warn};
+
+use cgroups_rs::{Cgroup, CgroupPid};
 use futures::{
   future::FutureExt,
   stream::TryStreamExt,
 };
-use log::{trace, warn};
-use tokio::{fs, select};
-
-use cgroups_rs::{Cgroup, CgroupPid};
 use ipnetwork::IpNetwork;
 use libc::{sethostname, setsid, TIOCSCTTY};
 use nix::{
@@ -30,6 +31,7 @@ use oci_spec::image::{Config, ImageConfiguration};
 use path_absolutize::Absolutize;
 use platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
 use sys_mount::{FilesystemType, Mount, MountFlags};
+use tokio::{fs, select};
 
 use krata::{
   ethtool::EthtoolHandle,
@@ -112,13 +114,11 @@ impl GuestInit {
     let launch = self.parse_launch_config().await?;
 
     self.mount_root_image(launch.root.format.clone()).await?;
-
     self.mount_addons().await?;
-
+ 
     self.mount_new_root().await?;
     self.mount_kernel_modules().await?;
     self.bind_new_root().await?;
-
     if let Some(hostname) = launch.hostname.clone() {
       let result = unsafe {
         sethostname(
@@ -129,7 +129,7 @@ impl GuestInit {
       if result != 0 {
         warn!("failed to set hostname: {}", result);
       }
-
+ 
       let etc = PathBuf::from_str("/etc")?;
       if !etc.exists() {
         fs::create_dir(&etc).await?;
@@ -138,25 +138,25 @@ impl GuestInit {
       etc_hostname.push("hostname");
       fs::write(&etc_hostname, hostname + "\n").await?;
     }
-
+ 
     if let Some(network) = &launch.network {
       trace!("initializing network");
       if let Err(error) = self.network_setup(&launch, network).await {
         warn!("failed to initialize network: {}", error);
       }
     }
-
+ 
     if let Some(cfg) = config.config() {
       trace!("running guest task");
       self.run(cfg, &launch, idm).await?;
-      Ok(())
     } else {
-      Err(anyhow!(
+      return Err(anyhow!(
         "unable to determine what to execute, image config doesn't tell us"
-      ))
+      ));
     }
+    Ok(())
   }
-
+ 
   async fn early_init(&mut self) -> Result<()> {
     trace!("early init");
     self.create_dir("/dev", Some(0o0755)).await?;
@@ -198,8 +198,8 @@ impl GuestInit {
       &PathBuf::from(ADDONS_DEVICE_PATH),
       &PathBuf::from(ADDONS_MOUNT_PATH),
       LaunchPackedFormat::Squashfs,
-    ).await?;
-
+    )
+    .await?;
     Ok(())
   }
 
@@ -268,8 +268,91 @@ impl GuestInit {
       Path::new(CONFIG_BLOCK_DEVICE_PATH),
       config_mount_path,
       LaunchPackedFormat::Squashfs,
-    )
-    .await?;
+    if let Some(hostname) = launch.hostname.clone() {
+      let result = unsafe {
+        sethostname(
+          hostname.as_bytes().as_ptr() as *mut libc::c_char,
+          hostname.len(),
+        )
+      };
+      if result != 0 {
+        warn!("failed to set hostname: {}", result);
+      }
+
+      let etc = PathBuf::from_str("/etc")?;
+      if !etc.exists() {
+        fs::create_dir(&etc).await?;
+      }
+      let mut etc_hostname = etc;
+      etc_hostname.push("hostname");
+      fs::write(&etc_hostname, hostname + "\n").await?;
+    }
+
+    if let Some(network) = &launch.network {
+      trace!("initializing network");
+      if let Err(error) = self.network_setup(&launch, network).await {
+        warn!("failed to initialize network: {}", error);
+      }
+    }
+
+    if let Some(cfg) = config.config() {
+      trace!("running guest task");
+      self.run(cfg, &launch, idm).await?;
+
+      Ok(())
+    } else {
+      Err(anyhow!(
+        "unable to determine what to execute, image config doesn't tell us"
+      ))
+    }
+  }
+
+  async fn create_dir(&mut self, path: &str, mode: Option<u32>) -> Result<()> {
+    let path = Path::new(path);
+    if !path.is_dir() {
+      trace!("creating directory {:?}", path);
+      fs::create_dir(path).await?;
+    }
+    if let Some(mode) = mode {
+      let permissions = Permissions::from_mode(mode);
+      trace!("setting directory{:?} permissions to {:?}", path, mode);
+      fs::set_permissions(path, permissions).await?;
+    }
+    Ok(())
+  }
+
+  async fn mount_kernel_fs(
+    &mut self,
+    fstype: &str,
+    path: &str,
+    data: &str,
+    flags: Option<MountFlags>,
+  ) -> Result<()> {
+    trace!("mounting kernel fs {} to {}", fstype, path);
+    Mount::builder()
+      .fstype(FilesystemType::Manual(fstype))
+      .flags(MountFlags::NOEXEC | MountFlags::NOSUID | flags.unwrap_or(MountFlags::empty()))
+      .data(data)
+      .mount(fstype, path)?;
+    Ok(())
+  }
+
+  fn map_console(&mut self, console: &File) -> Result<()> {
+    trace!("mapping console");
+    dup2(console.as_raw_fd(), 0)?;
+    dup2(console.as_raw_fd(), 1)?;
+    dup2(console.as_raw_fd(), 2)?;
+    Ok(())
+  }
+
+  async fn mount_config_image(&mut self) -> Result<()> {
+    trace!("mounting config image");
+    let config_mount_path = Path::new(CONFIG_MOUNT_PATH);
+    self.mount_image(
+      Path::new(CONFIG_BLOCK_DEVICE_PATH),
+      config_mount_path,
+      LaunchPackedFormat::Squashfs,
+    ).await?;
     Ok(())
   }
 
@@ -293,8 +376,8 @@ impl GuestInit {
     }
     Mount::builder()
       .fstype(FilesystemType::Manual(match format {
-        LaunchPackedFormat::Squashfs => "squashfs",
-        LaunchPackedFormat::Erofs => "erofs",
+          LaunchPackedFormat::Squashfs => "squashfs",
+          LaunchPackedFormat::Erofs => "erofs",
       }))
       .flags(MountFlags::RDONLY)
       .mount(from, to)?;
@@ -318,7 +401,7 @@ impl GuestInit {
     self.mount_overlay_tmpfs().await?;
     self.bind_image_to_overlay_tmpfs().await?;
     self.mount_overlay_to_new_root().await?;
-    std::env::set_current_dir(NEW_ROOT_PATH)?;
+std::env::set_current_dir(NEW_ROOT_PATH)?;
     trace!("mounted new root");
     Ok(())
   }
@@ -326,8 +409,8 @@ impl GuestInit {
   async fn mount_overlay_tmpfs(&mut self) -> Result<()> {
     fs::create_dir(OVERLAY_MOUNT_PATH).await?;
     Mount::builder()
-      .fstype(FilesystemType::Manual("tmpfs"))
-      .mount("tmpfs", OVERLAY_MOUNT_PATH)?;
+        .fstype(FilesystemType::Manual("tmpfs"))
+        .mount("tmpfs", OVERLAY_MOUNT_PATH)?;
     fs::create_dir(OVERLAY_UPPER_PATH).await?;
     fs::create_dir(OVERLAY_WORK_PATH).await?;
     Ok(())
@@ -470,8 +553,8 @@ impl GuestInit {
     let ipv6_ready = match ipv6_result {
       Ok(()) => true,
       Err(error) => {
-        warn!("unable to setup ipv6 network: {}", error);
-        false
+          warn!("unable to setup ipv6 network: {}", error);
+          false
       }
     };
 
@@ -570,6 +653,7 @@ impl GuestInit {
     }
 
     let cgroup = self.init_cgroup().await?;
+
     // TODO: impl From<oci_spec::image::Config> for ChildSpec
     let child_spec = ChildSpec {
       cmd: path,
@@ -590,7 +674,7 @@ impl GuestInit {
         success_code: Some(0),
       }
     };
-
+   
     self.supervisor.spawn_process(child_spec).await;
 
     let mut guest_bg = GuestBackground::new(idm, cgroup, Pid::from_raw(0), self.supervisor.clone()).await?;
@@ -601,11 +685,11 @@ impl GuestInit {
       _ = fatal_fut => Ok(()),
     }
   }
-
-  async fn init_cgroup(&self) -> Result<Cgroup> {
-    trace!("initializing cgroup");
-    let hierarchy = cgroups_rs::hierarchies::auto();
-    let cgroup = Cgroup::new(hierarchy, "krata-guest-task")?;
+ 
+   async fn init_cgroup(&self) -> Result<Cgroup> {
+     trace!("initializing cgroup");
+     let hierarchy = cgroups_rs::hierarchies::auto();
+     let cgroup = Cgroup::new(hierarchy, "krata-guest-task")?;
     cgroup.set_cgroup_type("threaded")?;
     trace!("initialized cgroup");
     Ok(cgroup)
@@ -635,54 +719,54 @@ impl GuestInit {
       .collect::<Vec<String>>()
   }
 
-//async fn fork_and_exec(
-//  &mut self,
-//  idm: IdmInternalClient,
-//  cgroup: Cgroup,
-//  working_dir: String,
-//  path: CString,
-//  cmd: Vec<CString>,
-//  env: Vec<CString>,
-//) -> Result<()> {
-//  match unsafe { fork()? } {
-//    ForkResult::Parent { child } => self.background(idm, cgroup, child).await,
-//    ForkResult::Child => self.foreground(cgroup, working_dir, path, cmd, env).await,
-//  }
-//}
+  // async fn fork_and_exec(
+  //   &mut self,
+  //   idm: IdmInternalClient,
+  //   cgroup: Cgroup,
+  //   working_dir: String,
+  //   path: CString,
+  //   cmd: Vec<CString>,
+  //   env: Vec<CString>,
+  // ) -> Result<()> {
+  //   match unsafe { fork()? } {
+  //     ForkResult::Parent { child } => self.background(idm, cgroup, child).await,
+  //     ForkResult::Child => self.foreground(cgroup, working_dir, path, cmd, env).await,
+  //   }
+  // }
 
-//async fn foreground(
-//  &mut self,
-//  cgroup: Cgroup,
-//  working_dir: String,
-//  path: CString,
-//  cmd: Vec<CString>,
-//  env: Vec<CString>,
-//) -> Result<()> {
-//  GuestInit::set_controlling_terminal()?;
-//  std::env::set_current_dir(working_dir)?;
-//  cgroup.add_task(CgroupPid::from(std::process::id() as u64))?;
-//  execve(&path, &cmd, &env)?;
-//  Ok(())
-//}
+  // async fn foreground(
+  //   &mut self,
+  //   cgroup: Cgroup,
+  //   working_dir: String,
+  //   path: CString,
+  //   cmd: Vec<CString>,
+  //   env: Vec<CString>,
+  // ) -> Result<()> {
+  //   GuestInit::set_controlling_terminal()?;
+  //   std::env::set_current_dir(working_dir)?;
+  //   cgroup.add_task(CgroupPid::from(std::process::id() as u64))?;
+  //   execve(&path, &cmd, &env)?;
+  //   Ok(())
+  // }
 
-//fn set_controlling_terminal() -> Result<()> {
-//  unsafe {
-//    setsid();
-//    set_controlling_terminal(io::stdin().as_raw_fd(), 0)?;
-//  }
-//  Ok(())
-//}
+  // fn set_controlling_terminal() -> Result<()> {
+  //   unsafe {
+  //     setsid();
+  //     set_controlling_terminal(io::stdin().as_raw_fd(), 0)?;
+  //   }
+  //   Ok(())
+  // }
 
-//async fn background(
-//  &mut self,
-//  idm: IdmInternalClient,
-//  cgroup: Cgroup,
-//  executed: Pid,
-//) -> Result<()> {
-//  let mut background = GuestBackground::new(idm, cgroup, executed).await?;
-//  background.run().await?;
-//  Ok(())
-//}
+  // async fn background(
+  //   &mut self,
+  //   idm: IdmInternalClient,
+  //   cgroup: Cgroup,
+  //   executed: Pid,
+  // ) -> Result<()> {
+  //   let mut background = GuestBackground::new(idm, cgroup, executed).await?;
+  //   background.run().await?;
+  //   Ok(())
+  // }
 }
 
 pub fn resolve_executable(env: &HashMap<String, String>, path: PathBuf) -> Result<PathBuf> {
@@ -705,4 +789,3 @@ pub fn resolve_executable(env: &HashMap<String, String>, path: PathBuf) -> Resul
   }
   Ok(path)
 }
-
