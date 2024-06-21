@@ -4,14 +4,16 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{self, JoinHandle},
 };
 
 use anyhow::Result;
 use libc::{c_int, waitpid, WEXITSTATUS, WIFEXITED};
 use log::warn;
 use nix::unistd::Pid;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::{
+    sync::mpsc::{channel, Receiver, Sender},
+    task::{self, JoinHandle},
+};
 
 const CHILD_WAIT_QUEUE_LEN: usize = 10;
 
@@ -35,7 +37,7 @@ impl ChildWait {
             sender,
             signal: signal.clone(),
         };
-        let task = thread::spawn(move || {
+        let task = task::spawn_blocking(move || {
             if let Err(error) = processor.process() {
                 warn!("failed to process child updates: {}", error);
             }
